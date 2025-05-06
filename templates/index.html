@@ -1,0 +1,220 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>移动设备摄像头监控</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+        #container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+        video { width: 100%; max-width: 640px; border: 1px solid #ccc; margin-bottom: 10px; background-color: #000;}
+        button { padding: 10px 15px; margin-right: 10px; border: none; border-radius: 4px; cursor: pointer; }
+        #startButton { background-color: #28a745; color: white; }
+        #stopButton { background-color: #dc3545; color: white; }
+        #status { margin-top: 15px; font-weight: bold; }
+        .hidden { display: none; }
+    </style>
+</head>
+<body>
+    <div id="container">
+        <h1>移动设备摄像头监控</h1>
+        <video id="liveVideo" autoplay muted playsinline></video>
+        <div>
+            <button id="startButton">开始录制</button>
+            <button id="stopButton" disabled>停止录制</button>
+        </div>
+        <div id="status">状态: 空闲</div>
+        <p><small>视频将实时传输到服务器并分段保存。</small></p>
+    </div>
+
+    <script>
+        const videoElement = document.getElementById('liveVideo');
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const statusElement = document.getElementById('status');
+
+        // 从Flask模板获取WebSocket服务器地址
+        const WS_URL = "{{ ws_address }}"; // e.g., 'ws://192.168.1.100:8765'
+
+        let mediaStream;
+        let mediaRecorder;
+        let webSocket;
+        let chunks = []; // 仅用于本地调试，实际是即时发送
+
+        const MimeType = 'video/webm; codecs="vp8, opus"'; // 或者 'video/webm; codecs=vp9,opus' 或 'video/mp4' (支持性较差)
+                                                       // 确保选择一个iPad Safari支持的MediaRecorder mimeType
+                                                       // iOS Safari 对 MediaRecorder 的支持有限，WebM (VP8/VP9) 是较好的选择
+
+        async function startRecording() {
+            if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+                statusElement.textContent = '错误: 浏览器不支持 getUserMedia API!';
+                alert('错误: 浏览器不支持 getUserMedia API!');
+                return;
+            }
+            if (!window.MediaRecorder) {
+                statusElement.textContent = '错误: 浏览器不支持 MediaRecorder API!';
+                alert('错误: 浏览器不支持 MediaRecorder API!');
+                return;
+            }
+            if (!MediaRecorder.isTypeSupported(MimeType)) {
+                statusElement.textContent = `错误: 不支持的MIME类型: ${MimeType}`;
+                alert(`错误: 不支持的MIME类型: ${MimeType}. 请尝试其他类型。`);
+                // 你可以尝试 'video/mp4' 但它在Safari的MediaRecorder中可能不稳定或不被支持
+                // 也可以尝试 'video/webm' (无编解码器)让浏览器选择默认
+                return;
+            }
+
+
+            statusElement.textContent = '状态: 请求摄像头权限...';
+            try {
+                mediaStream = await navigator.mediaDevices.getUserMedia({
+                    video: {
+                        facingMode: 'environment' // 'user' (前置) or 'environment' (后置)
+                    },
+                    audio: true // 同时录制音频
+                });
+                videoElement.srcObject = mediaStream;
+                statusElement.textContent = '状态: 摄像头已打开，准备连接服务器...';
+
+                connectWebSocket();
+
+            } catch (err) {
+                console.error("获取媒体设备失败:", err);
+                statusElement.textContent = `错误: 获取摄像头失败 - ${err.name}: ${err.message}`;
+                alert(`无法访问摄像头和麦克风: ${err.message}`);
+            }
+        }
+
+        function connectWebSocket() {
+            if (webSocket && webSocket.readyState === WebSocket.OPEN) {
+                console.log("WebSocket已连接，开始MediaRecorder");
+                setupMediaRecorder();
+                return;
+            }
+
+            webSocket = new WebSocket(WS_URL);
+
+            webSocket.onopen = () => {
+                console.log("WebSocket连接已建立");
+                statusElement.textContent = '状态: 已连接服务器，开始录制...';
+                setupMediaRecorder();
+                startButton.disabled = true;
+                stopButton.disabled = false;
+            };
+
+            webSocket.onmessage = (event) => {
+                // 服务器一般不主动发消息给客户端，除非是控制指令
+                console.log("收到服务器消息:", event.data);
+            };
+
+            webSocket.onclose = (event) => {
+                console.log("WebSocket连接已关闭:", event);
+                statusElement.textContent = '状态: 与服务器连接断开';
+                if (mediaRecorder && mediaRecorder.state === "recording") {
+                    mediaRecorder.stop();
+                }
+                startButton.disabled = false;
+                stopButton.disabled = true;
+                videoElement.srcObject = null; // 清除视频预览
+                if (mediaStream) {
+                    mediaStream.getTracks().forEach(track => track.stop()); // 关闭摄像头
+                }
+            };
+
+            webSocket.onerror = (error) => {
+                console.error("WebSocket错误:", error);
+                statusElement.textContent = '错误: WebSocket连接失败';
+                alert('WebSocket连接错误，请检查服务器是否运行，以及IP地址是否正确。');
+                // 尝试关闭以触发onclose中的清理
+                if (webSocket) webSocket.close();
+            };
+        }
+
+        function setupMediaRecorder() {
+            try {
+                mediaRecorder = new MediaRecorder(mediaStream, {
+                    mimeType: MimeType,
+                    // audioBitsPerSecond: 128000, // 可选
+                    // videoBitsPerSecond: 2500000, // 可选
+                });
+            } catch (e) {
+                console.error("MediaRecorder 初始化失败:", e);
+                statusElement.textContent = `错误: MediaRecorder 初始化失败 - ${e.message}`;
+                alert(`MediaRecorder 初始化失败: ${e.message}. 这可能是由于不支持的MIME类型或编解码器组合。`);
+                if (webSocket) webSocket.close(); // 关闭连接，因为无法录制
+                return;
+            }
+
+
+            mediaRecorder.ondataavailable = (event) => {
+                if (event.data && event.data.size > 0 && webSocket && webSocket.readyState === WebSocket.OPEN) {
+                    webSocket.send(event.data);
+                    // console.log(`Sent chunk of size ${event.data.size}`);
+                }
+            };
+
+            mediaRecorder.onstop = () => {
+                console.log("录制已停止。");
+                // 任何剩余的块也应该发送（如果有必要，但ondataavailable应该处理了）
+                // if (webSocket && webSocket.readyState === WebSocket.OPEN && chunks.length > 0) {
+                //     webSocket.send(new Blob(chunks, { type: MimeType }));
+                //     chunks = [];
+                // }
+                if (webSocket && webSocket.readyState === WebSocket.OPEN) {
+                     webSocket.close(); // 客户端主动停止时，关闭连接
+                }
+                statusElement.textContent = '状态: 录制已停止';
+                startButton.disabled = false;
+                stopButton.disabled = true;
+                if (mediaStream) {
+                    mediaStream.getTracks().forEach(track => track.stop()); // 关闭摄像头
+                }
+                videoElement.srcObject = null;
+            };
+
+            // timeslice参数让MediaRecorder定期触发ondataavailable事件
+            // 例如每1秒 (1000ms) 发送一次数据块
+            mediaRecorder.start(1000);
+            console.log("MediaRecorder已启动，每1000ms发送数据");
+        }
+
+
+        function stopRecording() {
+            if (mediaRecorder && mediaRecorder.state === "recording") {
+                mediaRecorder.stop(); // 这会触发onstop事件
+            } else {
+                // 如果mediaRecorder未在录制，但可能WebSocket还开着
+                if (webSocket && (webSocket.readyState === WebSocket.OPEN || webSocket.readyState === WebSocket.CONNECTING)) {
+                    webSocket.close();
+                }
+                if (mediaStream) {
+                    mediaStream.getTracks().forEach(track => track.stop());
+                }
+                videoElement.srcObject = null;
+                startButton.disabled = false;
+                stopButton.disabled = true;
+                statusElement.textContent = '状态: 空闲';
+            }
+        }
+
+        startButton.addEventListener('click', startRecording);
+        stopButton.addEventListener('click', stopRecording);
+
+        // 页面加载时自动尝试提示权限 (可选)
+        // window.addEventListener('load', () => {
+        //     // 可以在这里加一个“准备就绪”的按钮，用户点击后再请求权限
+        //     statusElement.textContent = '状态: 页面已加载，点击开始录制';
+        // });
+
+        // 处理页面关闭或刷新，确保资源释放
+        window.addEventListener('beforeunload', (event) => {
+            if (mediaRecorder && mediaRecorder.state === "recording") {
+                // 尝试发送一个信息给服务器表明即将关闭 (如果WebSocket还连接)
+                // webSocket.send("client_disconnecting"); // 可选
+                stopRecording(); // 停止录制并关闭连接
+            }
+        });
+
+    </script>
+</body>
+</html>
