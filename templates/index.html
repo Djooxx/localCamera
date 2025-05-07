@@ -25,6 +25,7 @@
         </div>
         <div id="status">状态: 空闲</div>
         <p><small>视频将实时传输到服务器并分段保存。</small></p>
+        <p><small>客户端分段时长: <span id="segmentDurationClient">N/A</span>秒</small></p>
     </div>
 
     <script>
@@ -32,63 +33,51 @@
         const startButton = document.getElementById('startButton');
         const stopButton = document.getElementById('stopButton');
         const statusElement = document.getElementById('status');
+        const segmentDurationClientElement = document.getElementById('segmentDurationClient');
 
-        // 从Flask模板获取WebSocket服务器地址
-        const WS_URL = "{{ ws_address }}"; // e.g., 'ws://192.168.1.100:8765'
+        const WS_URL = "{{ ws_address }}";
+        const MimeType = 'video/webm; codecs="vp8, opus"';
+        
+        // --- 客户端分段逻辑 ---
+        const CLIENT_SEGMENT_DURATION_SECONDS = 60; // 客户端控制的分段时长
+        segmentDurationClientElement.textContent = CLIENT_SEGMENT_DURATION_SECONDS;
+        let segmentIntervalId = null;
+        let isUserStopping = false; // 标记是否是用户主动停止
 
         let mediaStream;
         let mediaRecorder;
         let webSocket;
-        let chunks = []; // 仅用于本地调试，实际是即时发送
-
-        const MimeType = 'video/webm; codecs="vp8, opus"'; // 或者 'video/webm; codecs=vp9,opus' 或 'video/mp4' (支持性较差)
-                                                       // 确保选择一个iPad Safari支持的MediaRecorder mimeType
-                                                       // iOS Safari 对 MediaRecorder 的支持有限，WebM (VP8/VP9) 是较好的选择
 
         async function startRecording() {
             if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-                statusElement.textContent = '错误: 浏览器不支持 getUserMedia API!';
-                alert('错误: 浏览器不支持 getUserMedia API!');
-                return;
+                statusElement.textContent = '错误: 浏览器不支持 getUserMedia API!'; return;
             }
             if (!window.MediaRecorder) {
-                statusElement.textContent = '错误: 浏览器不支持 MediaRecorder API!';
-                alert('错误: 浏览器不支持 MediaRecorder API!');
-                return;
+                statusElement.textContent = '错误: 浏览器不支持 MediaRecorder API!'; return;
             }
             if (!MediaRecorder.isTypeSupported(MimeType)) {
-                statusElement.textContent = `错误: 不支持的MIME类型: ${MimeType}`;
-                alert(`错误: 不支持的MIME类型: ${MimeType}. 请尝试其他类型。`);
-                // 你可以尝试 'video/mp4' 但它在Safari的MediaRecorder中可能不稳定或不被支持
-                // 也可以尝试 'video/webm' (无编解码器)让浏览器选择默认
-                return;
+                statusElement.textContent = `错误: 不支持的MIME类型: ${MimeType}`; return;
             }
-
 
             statusElement.textContent = '状态: 请求摄像头权限...';
             try {
                 mediaStream = await navigator.mediaDevices.getUserMedia({
-                    video: {
-                        facingMode: 'environment' // 'user' (前置) or 'environment' (后置)
-                    },
-                    audio: true // 同时录制音频
+                    video: { facingMode: 'environment' }, audio: true
                 });
                 videoElement.srcObject = mediaStream;
                 statusElement.textContent = '状态: 摄像头已打开，准备连接服务器...';
-
+                isUserStopping = false; // 重置标记
                 connectWebSocket();
-
             } catch (err) {
                 console.error("获取媒体设备失败:", err);
                 statusElement.textContent = `错误: 获取摄像头失败 - ${err.name}: ${err.message}`;
-                alert(`无法访问摄像头和麦克风: ${err.message}`);
             }
         }
 
         function connectWebSocket() {
             if (webSocket && webSocket.readyState === WebSocket.OPEN) {
                 console.log("WebSocket已连接，开始MediaRecorder");
-                setupMediaRecorder();
+                startNewMediaRecorderInstance(); // 开始第一个MediaRecorder实例
                 return;
             }
 
@@ -97,124 +86,156 @@
             webSocket.onopen = () => {
                 console.log("WebSocket连接已建立");
                 statusElement.textContent = '状态: 已连接服务器，开始录制...';
-                setupMediaRecorder();
                 startButton.disabled = true;
                 stopButton.disabled = false;
+                startNewMediaRecorderInstance(); // WebSocket打开后，开始第一个MediaRecorder实例
             };
 
-            webSocket.onmessage = (event) => {
-                // 服务器一般不主动发消息给客户端，除非是控制指令
-                console.log("收到服务器消息:", event.data);
-            };
+            webSocket.onmessage = (event) => { console.log("收到服务器消息:", event.data); };
 
             webSocket.onclose = (event) => {
                 console.log("WebSocket连接已关闭:", event);
                 statusElement.textContent = '状态: 与服务器连接断开';
-                if (mediaRecorder && mediaRecorder.state === "recording") {
-                    mediaRecorder.stop();
-                }
-                startButton.disabled = false;
-                stopButton.disabled = true;
-                videoElement.srcObject = null; // 清除视频预览
-                if (mediaStream) {
-                    mediaStream.getTracks().forEach(track => track.stop()); // 关闭摄像头
-                }
+                cleanUpRecordingResources(true); // WebSocket关闭时，确保清理
             };
 
             webSocket.onerror = (error) => {
                 console.error("WebSocket错误:", error);
                 statusElement.textContent = '错误: WebSocket连接失败';
                 alert('WebSocket连接错误，请检查服务器是否运行，以及IP地址是否正确。');
-                // 尝试关闭以触发onclose中的清理
-                if (webSocket) webSocket.close();
+                if (webSocket) webSocket.close(); // 尝试关闭以触发onclose中的清理
             };
         }
 
-        function setupMediaRecorder() {
-            try {
-                mediaRecorder = new MediaRecorder(mediaStream, {
-                    mimeType: MimeType,
-                    // audioBitsPerSecond: 128000, // 可选
-                    // videoBitsPerSecond: 2500000, // 可选
-                });
-            } catch (e) {
-                console.error("MediaRecorder 初始化失败:", e);
-                statusElement.textContent = `错误: MediaRecorder 初始化失败 - ${e.message}`;
-                alert(`MediaRecorder 初始化失败: ${e.message}. 这可能是由于不支持的MIME类型或编解码器组合。`);
-                if (webSocket) webSocket.close(); // 关闭连接，因为无法录制
+        function startNewMediaRecorderInstance() {
+            if (!mediaStream || !mediaStream.active) {
+                console.error("无法启动MediaRecorder: mediaStream无效或未激活。");
+                statusElement.textContent = '错误: 摄像头流丢失。';
+                cleanUpRecordingResources(true); // 尝试优雅关闭
+                return;
+            }
+             if (!webSocket || webSocket.readyState !== WebSocket.OPEN) {
+                console.error("无法启动MediaRecorder: WebSocket未打开。");
+                statusElement.textContent = '错误: 服务器连接丢失。';
+                // cleanUpRecordingResources(true); // onclose会处理
                 return;
             }
 
+            console.log("尝试启动新的MediaRecorder实例...");
+            try {
+                mediaRecorder = new MediaRecorder(mediaStream, { mimeType: MimeType });
+            } catch (e) {
+                console.error("MediaRecorder 初始化失败:", e);
+                statusElement.textContent = `错误: MediaRecorder 初始化失败 - ${e.message}`;
+                cleanUpRecordingResources(true);
+                return;
+            }
 
             mediaRecorder.ondataavailable = (event) => {
                 if (event.data && event.data.size > 0 && webSocket && webSocket.readyState === WebSocket.OPEN) {
-                    webSocket.send(event.data);
-                    // console.log(`Sent chunk of size ${event.data.size}`);
+                    webSocket.send(event.data); // 第一个event.data将包含头部
                 }
             };
 
             mediaRecorder.onstop = () => {
-                console.log("录制已停止。");
-                // 任何剩余的块也应该发送（如果有必要，但ondataavailable应该处理了）
-                // if (webSocket && webSocket.readyState === WebSocket.OPEN && chunks.length > 0) {
-                //     webSocket.send(new Blob(chunks, { type: MimeType }));
-                //     chunks = [];
-                // }
-                if (webSocket && webSocket.readyState === WebSocket.OPEN) {
-                     webSocket.close(); // 客户端主动停止时，关闭连接
+                console.log("MediaRecorder.onstop 事件触发.");
+                // 如果不是用户主动停止，并且WebSocket仍然连接，则尝试为下一个分段启动新的MediaRecorder
+                if (!isUserStopping && webSocket && webSocket.readyState === WebSocket.OPEN && mediaStream && mediaStream.active) {
+                    console.log("非用户停止，准备下一个分段。");
+                    // 在启动新实例前，先发信号
+                    if (webSocket && webSocket.readyState === WebSocket.OPEN) {
+                         console.log("发送 new_segment_signal 到服务器。");
+                         webSocket.send(JSON.stringify({type: "new_segment_signal"}));
+                    }
+                    startNewMediaRecorderInstance(); // 递归调用以启动下一个分段的录制
+                } else {
+                    console.log("用户停止或无法继续分段，执行完全清理。");
+                    cleanUpRecordingResources(false); // 执行最终清理，但不关闭websocket（如果它是因为其他原因要关闭）
                 }
-                statusElement.textContent = '状态: 录制已停止';
-                startButton.disabled = false;
-                stopButton.disabled = true;
-                if (mediaStream) {
-                    mediaStream.getTracks().forEach(track => track.stop()); // 关闭摄像头
-                }
-                videoElement.srcObject = null;
+            };
+            
+            mediaRecorder.onerror = (event) => {
+                console.error("MediaRecorder 发生错误:", event.error);
+                statusElement.textContent = `错误: MediaRecorder - ${event.error.name || '未知错误'}`;
+                isUserStopping = true; // 标记为用户停止以进行全面清理
+                cleanUpRecordingResources(true); // 发生错误时，清理资源
             };
 
-            // timeslice参数让MediaRecorder定期触发ondataavailable事件
-            // 例如每1秒 (1000ms) 发送一次数据块
-            mediaRecorder.start(1000);
-            console.log("MediaRecorder已启动，每1000ms发送数据");
+            mediaRecorder.start(1000); // timeslice参数让MediaRecorder定期触发ondataavailable
+            console.log("MediaRecorder已启动，每1000ms发送数据。新的分段开始。");
+            statusElement.textContent = '状态: 录制中...';
+
+            // 清除旧的定时器并为当前分段设置新的定时器
+            if (segmentIntervalId) clearInterval(segmentIntervalId);
+            segmentIntervalId = setInterval(() => {
+                if (mediaRecorder && mediaRecorder.state === "recording") {
+                    console.log(`客户端分段时长 ${CLIENT_SEGMENT_DURATION_SECONDS}s 到达，准备停止当前MediaRecorder。`);
+                    // isUserStopping 保持 false，这样 onstop 时会尝试重启
+                    mediaRecorder.stop(); // 这将触发 onstop
+                }
+            }, CLIENT_SEGMENT_DURATION_SECONDS * 1000);
         }
 
-
-        function stopRecording() {
+        function stopRecording() { // 用户点击“停止录制”按钮
+            console.log("用户点击停止录制。");
+            isUserStopping = true; // 明确是用户主动停止
+            if (segmentIntervalId) {
+                clearInterval(segmentIntervalId);
+                segmentIntervalId = null;
+            }
             if (mediaRecorder && mediaRecorder.state === "recording") {
-                mediaRecorder.stop(); // 这会触发onstop事件
+                mediaRecorder.stop(); // 会触发onstop，然后进行清理
             } else {
-                // 如果mediaRecorder未在录制，但可能WebSocket还开着
-                if (webSocket && (webSocket.readyState === WebSocket.OPEN || webSocket.readyState === WebSocket.CONNECTING)) {
-                    webSocket.close();
-                }
-                if (mediaStream) {
-                    mediaStream.getTracks().forEach(track => track.stop());
-                }
-                videoElement.srcObject = null;
-                startButton.disabled = false;
-                stopButton.disabled = true;
-                statusElement.textContent = '状态: 空闲';
+                cleanUpRecordingResources(true); // 如果没有在录制，也执行清理
+            }
+        }
+        
+        function cleanUpRecordingResources(closeWebSocketIfNeeded) {
+            console.log("执行清理资源操作...");
+            if (segmentIntervalId) {
+                clearInterval(segmentIntervalId);
+                segmentIntervalId = null;
+            }
+
+            if (mediaRecorder && (mediaRecorder.state === "recording" || mediaRecorder.state === "paused")) {
+                // 确保onstop不会尝试重启
+                mediaRecorder.onstop = null; 
+                if(mediaRecorder.state === "recording") mediaRecorder.stop();
+            }
+            mediaRecorder = null;
+
+            if (mediaStream) {
+                mediaStream.getTracks().forEach(track => track.stop());
+                mediaStream = null;
+            }
+            videoElement.srcObject = null;
+            
+            if (closeWebSocketIfNeeded && webSocket && 
+                (webSocket.readyState === WebSocket.OPEN || webSocket.readyState === WebSocket.CONNECTING)) {
+                console.log("清理资源时关闭WebSocket。");
+                webSocket.close();
+            }
+            // 如果WebSocket已经关闭或正在关闭，onclose事件会处理按钮状态
+
+            // 如果WebSocket仍然打开（例如，只是停止录制但保持连接），则手动更新按钮
+            if (!closeWebSocketIfNeeded || (webSocket && webSocket.readyState !== WebSocket.CLOSING && webSocket.readyState !== WebSocket.CLOSED) ) {
+                 startButton.disabled = false;
+                 stopButton.disabled = true;
+                 statusElement.textContent = '状态: 空闲';
             }
         }
 
         startButton.addEventListener('click', startRecording);
         stopButton.addEventListener('click', stopRecording);
 
-        // 页面加载时自动尝试提示权限 (可选)
-        // window.addEventListener('load', () => {
-        //     // 可以在这里加一个“准备就绪”的按钮，用户点击后再请求权限
-        //     statusElement.textContent = '状态: 页面已加载，点击开始录制';
-        // });
-
-        // 处理页面关闭或刷新，确保资源释放
         window.addEventListener('beforeunload', (event) => {
+            isUserStopping = true; // 页面卸载，视为用户停止
             if (mediaRecorder && mediaRecorder.state === "recording") {
-                // 尝试发送一个信息给服务器表明即将关闭 (如果WebSocket还连接)
-                // webSocket.send("client_disconnecting"); // 可选
-                stopRecording(); // 停止录制并关闭连接
+                stopRecording(); 
+            } else if (webSocket && webSocket.readyState === WebSocket.OPEN) {
+                webSocket.close();
             }
         });
-
     </script>
 </body>
 </html>
