@@ -50,7 +50,7 @@ localCamera/
     项目需要 `server.crt` 和 `server.key` 文件用于 HTTPS 和 WSS。如果文件不存在，`server.py` 启动时会提示如何生成。你需要将 `server.py` 中 `SERVER_LAN_IP` 变量的值（默认为 `192.168.1.3`）替换为你服务器在局域网中的实际 IP 地址，并在生成证书时使用此 IP 作为通用名称 (CN)。
     例如，如果你的服务器IP是 `192.168.1.100`，则生成命令如下：
     ```bash
-    openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt -sha256 -days 365 -nodes -subj "/CN=192.168.1.100"
+    openssl req -x509 -newkey rsa:2048 -keyout server.key -out server.crt -sha256 -days 365 -nodes -subj "/CN=192.168.1.51"
     ```
     将生成的 `server.crt` 和 `server.key` 文件放置在项目根目录。
 
