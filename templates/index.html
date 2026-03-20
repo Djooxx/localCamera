@@ -37,7 +37,7 @@
     const formatInfo = document.getElementById('formatInfo');
 
     const WS_URL = "{{ ws_address }}";
-    const CLIENT_SEGMENT_DURATION_SECONDS = 60;
+    const CLIENT_SEGMENT_DURATION_SECONDS = 30;
 
     let mediaStream;
     let mediaRecorder;
@@ -50,34 +50,32 @@
     let currentFacingMode = 'user'; // 'user' 为前置, 'environment' 为后置
     const switchButton = document.getElementById('switchButton');
 
-    // 1. 动态获取最合适的录制格式 (优先iOS支持的MP4)
+    // ==================== 1. 强制 WebM + 最高画质 (VP9 优先) ====================
     function getBestMimeType() {
         const types = [
-            { mime: 'video/mp4; codecs="avc1.42E01E, mp4a.40.2"', ext: '.mp4' },
-            { mime: 'video/mp4', ext: '.mp4' },
+            { mime: 'video/webm; codecs="vp9, opus"', ext: '.webm' },   // ★ VP9 画质最高（推荐）
+            { mime: 'video/webm; codecs="vp8, opus"', ext: '.webm' },
             { mime: 'video/webm; codecs="h264, opus"', ext: '.webm' },
-            { mime: 'video/webm; codecs="vp8, opus"', ext: '.webm' }
+            { mime: 'video/mp4; codecs="avc1.42E01E, mp4a.40.2"', ext: '.mp4' },
+            { mime: 'video/mp4', ext: '.mp4' }
         ];
         for (let t of types) {
             if (window.MediaRecorder && MediaRecorder.isTypeSupported(t.mime)) {
                 return t;
             }
         }
-        return { mime: '', ext: '.webm' }; // Fallback
+        return { mime: 'video/webm', ext: '.webm' };
     }
 
     const bestFormat = getBestMimeType();
-    formatInfo.textContent = `当前录制格式: ${bestFormat.ext.toUpperCase()} (MIME: ${bestFormat.mime || 'Default'})`;
+    formatInfo.textContent = `当前录制格式: ${bestFormat.ext.toUpperCase()} (MIME: ${bestFormat.mime || 'Default'}) - 25Mbps 最高画质`;
 
-    // 2. 请求屏幕常亮防休眠 (Wake Lock)
+    // 2. 请求屏幕常亮
     async function requestWakeLock() {
         if ('wakeLock' in navigator) {
             try {
                 wakeLock = await navigator.wakeLock.request('screen');
-                console.log('屏幕已锁定常亮');
-            } catch (err) {
-                console.error('防休眠锁定失败:', err.name, err.message);
-            }
+            } catch (err) {}
         }
     }
 
@@ -87,23 +85,16 @@
         }
     }
 
-    // 切换摄像头逻辑
+    // 切换摄像头
     switchButton.addEventListener('click', async () => {
         currentFacingMode = (currentFacingMode === 'user') ? 'environment' : 'user';
         statusElement.textContent = `状态: 正在切换至 ${currentFacingMode === 'user' ? '前置' : '后置'}...`;
 
         if (mediaStream) {
-            // 如果正在录制，需要先停止当前的流
-            const wasRecording = (mediaRecorder && mediaRecorder.state === "recording");
-
-            // 停止旧轨道
             mediaStream.getTracks().forEach(track => track.stop());
-
-            // 重新启动新配置的摄像头
             await startRecording();
         }
     });
-
 
     async function startRecording() {
         if (autoReconnectTimer) clearTimeout(autoReconnectTimer);
@@ -111,14 +102,12 @@
 
         statusElement.textContent = '状态: 请求摄像头...';
         try {
-            // --- 核心修改：提升质量 & 强制前/后置 ---
             const constraints = {
                 video: {
-                    // 使用 exact 强制要求，如果硬件不支持 60fps 会报错，方便调试
                     facingMode: { exact: currentFacingMode },
                     width: { exact: 1920 },
                     height: { exact: 1080 },
-                    frameRate: { ideal: 60, min: 30 } // 尽量 60，最低 30
+                    frameRate: { ideal: 60, min: 30 }
                 },
                 audio: true
             };
@@ -126,11 +115,9 @@
             mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
             videoElement.srcObject = mediaStream;
 
-            // 如果 WebSocket 没连，则连接；如果已连接，则重启录制器
             if (!webSocket || webSocket.readyState !== WebSocket.OPEN) {
                 connectWebSocket();
             } else {
-                // 切换摄像头时，发送一个分段信号给服务器，并重启录像机
                 webSocket.send(JSON.stringify({type: "new_segment_signal"}));
                 startNewMediaRecorderInstance();
             }
@@ -138,12 +125,11 @@
             requestWakeLock();
             startButton.disabled = true;
             stopButton.disabled = false;
-            statusElement.textContent = `状态: ${currentFacingMode === 'user' ? '前置' : '后置'} 1080p 录制中`;
+            statusElement.textContent = `状态: ${currentFacingMode === 'user' ? '前置' : '后置'} 1080p60 WebM 录制中 (25Mbps)`;
 
         } catch (err) {
             console.error(err);
-            statusElement.textContent = `错误: 切换失败。设备可能不支持此参数 (${err.message})`;
-            // 如果 exact 模式报错（比如后置确实不支持60帧），这里可以做个降级处理
+            statusElement.textContent = `错误: ${err.message}`;
         }
     }
 
@@ -154,7 +140,6 @@
 
         webSocket.onopen = () => {
             statusElement.textContent = '状态: 已连接，开始录制...';
-            // 告诉服务器我们当前使用的是 MP4 还是 WebM
             webSocket.send(JSON.stringify({ type: "init", extension: bestFormat.ext }));
             startNewMediaRecorderInstance();
         };
@@ -162,10 +147,7 @@
         webSocket.onclose = () => {
             statusElement.textContent = '状态: 服务器断开';
             cleanUpRecordingResources(true);
-
-            // 4. 断线自动重连机制
             if (!isUserStopping) {
-                statusElement.textContent = '状态: 掉线，5秒后自动重连...';
                 autoReconnectTimer = setTimeout(startRecording, 5000);
             }
         };
@@ -179,10 +161,9 @@
     function startNewMediaRecorderInstance() {
         if (!mediaStream || !webSocket || webSocket.readyState !== WebSocket.OPEN) return;
 
-        // 设置录制参数：限制码率
         const options = bestFormat.mime ? {
             mimeType: bestFormat.mime,
-            videoBitsPerSecond: 15000000,
+            videoBitsPerSecond: 25000000,
             audioBitsPerSecond: 320000
         } : {};
 
@@ -231,10 +212,10 @@
     }
 
     function cleanUpRecordingResources(closeWS) {
-        if (segmentIntervalId) clearInterval(segmentIntervalId);
+        if (segmentIntervalId) clearTimeout(segmentIntervalId);
         if (mediaRecorder) {
             mediaRecorder.onstop = null;
-            if(mediaRecorder.state === "recording") mediaRecorder.stop();
+            if (mediaRecorder.state === "recording") mediaRecorder.stop();
         }
         if (mediaStream) mediaStream.getTracks().forEach(t => t.stop());
 
